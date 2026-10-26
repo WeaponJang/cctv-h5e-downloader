@@ -1,0 +1,57 @@
+// =============================================================================
+// version.rc — dec.exe 的 Windows 文件属性（版本信息资源）
+//
+// 效果：右键 dec.exe → 属性 → 详细信息，可见文件描述 / 版本 / 产品类型等；
+//       文件管理器“类型”列显示“应用程序”而非“文件”。
+//
+// 编译（由 编译cpp20.bat 自动调用）:
+//   windres -i version.rc -O coff -o version_res.o
+//   g++ ... -o dec.exe cctv_h5e_decrypt.cpp version_res.o
+//
+// 注意：本文件以 UTF-8 保存，#pragma code_page(65001) 保证中文属性值正确。
+// =============================================================================
+
+#include <winres.h>
+
+#pragma code_page(65001)
+
+// ---- 应用图标（ID 必须为最小值，Explorer 取组内 ID 最低者作为 exe 图标）----
+1 ICON "app.ico"
+
+// ---- 版本号（需要升级时只改这四个宏） ----
+#define VER_MAJOR  1
+#define VER_MINOR  0
+#define VER_PATCH  0
+#define VER_BUILD  0
+
+VS_VERSION_INFO VERSIONINFO
+ FILEVERSION    VER_MAJOR,VER_MINOR,VER_PATCH,VER_BUILD
+ PRODUCTVERSION VER_MAJOR,VER_MINOR,VER_PATCH,VER_BUILD
+ FILEFLAGSMASK  VS_FFI_FILEFLAGSMASK
+ FILEFLAGS      0
+ FILEOS         VOS_NT_WINDOWS32
+ FILETYPE       VFT_APP
+ FILESUBTYPE    VFT2_UNKNOWN
+BEGIN
+    BLOCK "StringFileInfo"
+    BEGIN
+        // 000004b0: 语言中立(0x0000) + Unicode 代码页(0x04b0=1200)，
+        // 任何系统显示语言下都能正常显示中文属性值
+        BLOCK "000004b0"
+        BEGIN
+            VALUE "FileDescription",  "CCTV HLS h5e MPEG-TS 解密工具"
+            VALUE "ProductName",      "cctv_h5e_decrypt"
+            VALUE "ProductVersion",   "1.0.0.0"
+            VALUE "FileVersion",      "1.0.0.0"
+            VALUE "OriginalFilename", "dec.exe"
+            VALUE "InternalName",     "dec"
+            VALUE "CompanyName",      "CCTV h5e decrypt"
+            VALUE "LegalCopyright",   "Internal use only"
+            VALUE "Comments",         "C++20 单文件静态构建 (MinGW)"
+        END
+    END
+    BLOCK "VarFileInfo"
+    BEGIN
+        VALUE "Translation", 0x0000, 0x04b0
+    END
+END
