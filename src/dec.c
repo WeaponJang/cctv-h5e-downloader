@@ -18,6 +18,10 @@
 // 用法：
 //   dec.exe <加密.ts> <输出.ts> [--pid 0x100]
 //
+// 内存：按视频 PES 起点分块流式解密（目标 32MB/块），峰值内存与文件大小无关。
+// 安全：输出先写 <输出>.part，成功后再原子替换目标；任何失败都不会改动已存在的
+//       目标文件，也不会改动输入（输入与输出同路径时请预留额外一份空间）。
+//
 // 源码为 UTF-8（无 BOM）；命令行用 CommandLineToArgvW 取宽字符，文件用宽字符
 // API 读写，因此任意语言版本的 Windows 下中文提示不乱码、中文路径可正常读写。
 //
@@ -59,12 +63,6 @@ typedef struct cctv_h5e_session cctv_h5e_session;
 #define H5E_GRID_TAIL_GUARD 17u   /* 网格单元起点至少要剩这么多字节 */
 #define H5E_TYPE1_MIN_LEN   129u  /* type1 低于此长度原样透传（不解密也不丢 EPB） */
 
-/* 与原版 cctv_h5e_decrypt.hpp 保持逐字节一致的两处取样（已实测 30MB 语料 0 字节差）。
- * 与官方 worker（仓库里的 输出测试.ts）相比会差 9422 字节，原因只有两条：
- *   1) EPB 03 丢弃用“按解密前位置无条件丢”，而 worker 仅当两字节仍是 00 00 才丢；
- *   2) type5 尾单元余量按 17 字节卡，worker 实测 11~16 即可进入（故少数 8 字节密文保持未解）。
- * 如需改为 worker 精确行为：把三处 h5e_drop_epb_03 的 false 改为 true，
- * 并把 h5e_decrypt_type5_new 里的 H5E_GRID_TAIL_GUARD 换成 11。 */
 
 /* >>>>>>>>>>>>>>>>>>>>>> ENGINE BEGIN >>>>>>>>>>>>>>>>>>>>>> */
 
@@ -534,14 +532,39 @@ typedef struct {
     size_t sc;  /* start code 长度：3 或 4 */
 } h5e_sc;
 
+/* 按需扩容：*cap 为元素个数，elem 为单元素字节数；失败返回 -1 且原缓冲保持有效。
+ * 原实现按整块 TS 长度线性预分配（start code 表 len/3*16 ≈ 5.3 倍 TS 大小），
+ * 改为按需增长后，缓冲只在单个 PES 规模内增长，与块大小/文件大小解耦。 */
+static int h5e_reserve(void **buf, size_t *cap, size_t need, size_t elem) {
+    if (need <= *cap) return 0;
+    size_t ncap = *cap ? *cap : 64;
+    while (ncap < need) {
+        if (ncap > SIZE_MAX / 2) {
+            ncap = need;
+            break;
+        }
+        ncap <<= 1;
+    }
+    if (elem == 0 || ncap > SIZE_MAX / elem) return -1;
+    void *p = realloc(*buf, ncap * elem);
+    if (!p) return -1;
+    *buf = p;
+    *cap = ncap;
+    return 0;
+}
+
 typedef struct {
     cctv_h5e_session *session;
-    uint8_t *pes;      /* 累积的 PES 字节 */
-    uint8_t *out;      /* 重建后的 PES */
+    uint8_t *pes; /* 累积的 PES 字节 */
+    uint8_t *out; /* 重建后的 PES */
     h5e_span *spans;
     h5e_sc *starts;
-    size_t pes_n, out_n, spans_n, starts_n;
+    size_t pes_n, pes_cap;
+    size_t out_n, out_cap;
+    size_t spans_n, spans_cap;
+    size_t starts_n, starts_cap;
     size_t nal_count;
+    bool oom; /* 扩容失败：上层据此区分“内存不足”与“没有 NAL” */
 } h5e_ts_ctx;
 
 /* 处理一个完整 PES：切 NAL → 解密 → 重建 → 回写 TS 各包 payload。 */
@@ -558,6 +581,14 @@ static void h5e_flush_pes(uint8_t *data, size_t len, h5e_ts_ctx *ctx) {
         return;
     }
 
+    /* 重建缓冲最多与 PES 等长（解密只会收缩），按需扩容到本次 PES 规模。 */
+    if (h5e_reserve((void **)&ctx->out, &ctx->out_cap, pes_n, 1) != 0) {
+        ctx->oom = true;
+        ctx->pes_n = 0;
+        ctx->spans_n = 0;
+        return;
+    }
+
     memcpy(ctx->out, pes, base_skip); /* PES 头原样保留 */
     size_t out_n = base_skip;
 
@@ -568,19 +599,27 @@ static void h5e_flush_pes(uint8_t *data, size_t len, h5e_ts_ctx *ctx) {
     /* 扫描 ES 内的 NAL start code（先 4 字节，再 3 字节） */
     size_t ns = 0;
     for (size_t i = 0; i + 3 < es_n;) {
+        size_t sc = 0;
         if (i + 4 <= es_n && es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 0 && es[i + 3] == 1) {
-            ctx->starts[ns].pos = i;
-            ctx->starts[ns].sc = 4;
-            ns++;
-            i += 4;
+            sc = 4;
         } else if (es[i] == 0 && es[i + 1] == 0 && es[i + 2] == 1) {
-            ctx->starts[ns].pos = i;
-            ctx->starts[ns].sc = 3;
-            ns++;
-            i += 3;
-        } else {
-            i++;
+            sc = 3;
         }
+        if (sc == 0) {
+            i++;
+            continue;
+        }
+        if (h5e_reserve((void **)&ctx->starts, &ctx->starts_cap, ns + 1, sizeof(h5e_sc)) != 0) {
+            ctx->oom = true;
+            ctx->pes_n = 0;
+            ctx->spans_n = 0;
+            ctx->starts_n = 0;
+            return;
+        }
+        ctx->starts[ns].pos = i;
+        ctx->starts[ns].sc = sc;
+        ns++;
+        i += sc;
     }
     ctx->starts_n = ns;
 
@@ -659,25 +698,16 @@ static void h5e_flush_pes(uint8_t *data, size_t len, h5e_ts_ctx *ctx) {
     ctx->out_n = 0;
 }
 
-/* 原地解密 TS 缓冲中的全部视频 NAL，返回经过会话的 NAL 数。 */
-static size_t h5e_decrypt_ts_inplace(uint8_t *data, size_t len, cctv_h5e_session *session,
-                                     uint16_t vpid) {
+/* 原地解密 TS 缓冲中的全部视频 NAL。
+ * 返回 >=0：经过会话的 NAL 数；-1：内部错误（内存不足）。
+ * 缓冲全部按需增长，峰值内存只与单块内最大的 PES 相关，不随 len 线性膨胀。 */
+static long long h5e_decrypt_ts_inplace(uint8_t *data, size_t len, cctv_h5e_session *session,
+                                        uint16_t vpid) {
     if (!data || len < 188) return 0;
 
     h5e_ts_ctx ctx;
     memset(&ctx, 0, sizeof ctx);
     ctx.session = session;
-    ctx.pes = (uint8_t *)malloc(len);
-    ctx.out = (uint8_t *)malloc(len);
-    ctx.spans = (h5e_span *)malloc((len / 188 + 1) * sizeof(h5e_span));
-    ctx.starts = (h5e_sc *)malloc((len / 3 + 2) * sizeof(h5e_sc));
-    if (!ctx.pes || !ctx.out || !ctx.spans || !ctx.starts) {
-        free(ctx.pes);
-        free(ctx.out);
-        free(ctx.spans);
-        free(ctx.starts);
-        return 0;
-    }
 
     for (size_t off = 0; off + 188 <= len; off += 188) {
         if (data[off] != 0x47) continue;
@@ -690,6 +720,11 @@ static size_t h5e_decrypt_ts_inplace(uint8_t *data, size_t len, cctv_h5e_session
         if (pi >= 188) continue;
         size_t payload_len = 188 - pi;
         if (pusi) h5e_flush_pes(data, len, &ctx);
+        if (h5e_reserve((void **)&ctx.pes, &ctx.pes_cap, ctx.pes_n + payload_len, 1) != 0 ||
+            h5e_reserve((void **)&ctx.spans, &ctx.spans_cap, ctx.spans_n + 1, sizeof(h5e_span)) != 0) {
+            ctx.oom = true;
+            break;
+        }
         memcpy(ctx.pes + ctx.pes_n, data + off + pi, payload_len);
         ctx.pes_n += payload_len;
         ctx.spans[ctx.spans_n].pkt_off = off;
@@ -697,91 +732,251 @@ static size_t h5e_decrypt_ts_inplace(uint8_t *data, size_t len, cctv_h5e_session
         ctx.spans[ctx.spans_n].pl = payload_len;
         ctx.spans_n++;
     }
-    h5e_flush_pes(data, len, &ctx);
+    if (!ctx.oom) h5e_flush_pes(data, len, &ctx);
 
     const size_t nal_count = ctx.nal_count;
+    const bool oom = ctx.oom;
     free(ctx.pes);
     free(ctx.out);
     free(ctx.spans);
     free(ctx.starts);
-    return nal_count;
+    return oom ? -1 : (long long)nal_count;
 }
 
 /* <<<<<<<<<<<<<<<<<<<<<< ENGINE END <<<<<<<<<<<<<<<<<<<<<< */
 
 /* ============================ 文件级读写（宽字符） ============================ */
 
-static int dec_read_whole_w(const wchar_t *path, uint8_t **out, size_t *out_len) {
-    *out = NULL;
-    *out_len = 0;
-    if (!path) return -1;
-    HANDLE h = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
-                           OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return -1;
-    LARGE_INTEGER sz;
-    if (!GetFileSizeEx(h, &sz) || sz.QuadPart < 0) {
-        CloseHandle(h);
-        return -1;
-    }
-    const size_t n = (size_t)sz.QuadPart;
-    uint8_t *buf = (uint8_t *)malloc(n ? n : 1);
-    if (!buf) {
-        CloseHandle(h);
-        return -1;
-    }
+/* 分块流式解密：按视频 PES 起点切块，每块解密后顺序写回。
+ * 峰值内存 ≈ 块大小 + 单块内引擎缓冲（O(最大 PES)），与文件总大小无关；
+ * 会话（type25 开关 / 是否新模式）跨块复用，结果与整文件一次性处理一致。 */
+#define DEC_CHUNK_BYTES ((size_t)32 * 1024 * 1024) /* 目标块大小 */
+#define DEC_READ_SLICE  ((size_t)4 * 1024 * 1024)  /* 单次补给量 */
+
+static bool dec_seek(HANDLE h, size_t off) {
+    LARGE_INTEGER li;
+    li.QuadPart = (LONGLONG)off;
+    return SetFilePointerEx(h, li, NULL, FILE_BEGIN) != 0;
+}
+
+/* 在 off 处读写 n 字节；内部分片，避开 DWORD 长度上限。 */
+static bool dec_read_at(HANDLE h, size_t off, uint8_t *buf, size_t n) {
+    if (!dec_seek(h, off)) return false;
     size_t got = 0;
     while (got < n) {
         DWORD want = (DWORD)((n - got) > 0x10000000u ? 0x10000000u : (n - got));
         DWORD read = 0;
-        if (!ReadFile(h, buf + got, want, &read, NULL) || read == 0) {
-            free(buf);
-            CloseHandle(h);
-            return -1;
-        }
+        if (!ReadFile(h, buf + got, want, &read, NULL) || read == 0) return false;
         got += read;
     }
-    CloseHandle(h);
-    *out = buf;
-    *out_len = n;
-    return 0;
+    return true;
 }
 
-static int dec_write_whole_w(const wchar_t *path, const uint8_t *data, size_t len) {
-    if (!path) return -1;
-    HANDLE h = CreateFileW(path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
-    if (h == INVALID_HANDLE_VALUE) return -1;
+static bool dec_write_at(HANDLE h, size_t off, const uint8_t *data, size_t n) {
+    if (!dec_seek(h, off)) return false;
     size_t put = 0;
-    while (put < len) {
-        DWORD want = (DWORD)((len - put) > 0x10000000u ? 0x10000000u : (len - put));
+    while (put < n) {
+        DWORD want = (DWORD)((n - put) > 0x10000000u ? 0x10000000u : (n - put));
         DWORD wrote = 0;
-        if (!WriteFile(h, data + put, want, &wrote, NULL) || wrote == 0) {
-            CloseHandle(h);
-            return -1;
-        }
+        if (!WriteFile(h, data + put, want, &wrote, NULL) || wrote == 0) return false;
         put += wrote;
     }
-    CloseHandle(h);
-    return 0;
+    return true;
 }
 
-/* 整文件：读 → 解密 → 写。返回 >=0 为写出字节数；-1 参数错、-2 读失败、-3 解密失败、-4 写失败。 */
+static char *dec_utf8_from_wide(const wchar_t *w);
+
+/* 目标临时路径 <输出>.part：与目标同目录，保证替换是同卷原子重命名。 */
+static wchar_t *dec_temp_path(const wchar_t *out_path) {
+    const size_t len = wcslen(out_path);
+    if (len == 0 || len > 32000) return NULL;
+    wchar_t *p = (wchar_t *)malloc((len + 8) * sizeof(wchar_t));
+    if (!p) return NULL;
+    memcpy(p, out_path, (len + 1) * sizeof(wchar_t));
+    memcpy(p + len, L".part", 6 * sizeof(wchar_t));
+    return p;
+}
+
+/* 该 TS 包是否为指定视频 PID 的 PES 起点。 */
+static bool dec_is_video_pes_start(const uint8_t *pkt, uint16_t vpid) {
+    if (pkt[0] != 0x47) return false;
+    if ((uint16_t)(((pkt[1] & 0x1f) << 8) | pkt[2]) != vpid) return false;
+    return (pkt[1] & 0x40) != 0;
+}
+
+/* 扫描缓冲内的视频 PES 起点，返回首个/最后一个包偏移。
+ * 切点取 PES 起点，保证每块从完整 PES 开始（同 decryptworker）。 */
+static bool dec_scan_video_pes(const uint8_t *data, size_t len, uint16_t vpid, size_t *first,
+                               size_t *last) {
+    bool found = false;
+    size_t f = 0, l = 0;
+    for (size_t off = 0; off + 188 <= len; off += 188) {
+        if (!dec_is_video_pes_start(data + off, vpid)) continue;
+        if (!found) f = off;
+        l = off;
+        found = true;
+    }
+    if (found) {
+        if (first) *first = f;
+        if (last) *last = l;
+    }
+    return found;
+}
+
+/* 读 → 分块解密 → 写。返回 >=0 为写出字节数；-1 参数错、-2 读失败、-3 解密失败、-4 写失败。 */
 static long long dec_decrypt_file_w(const wchar_t *in_path, const wchar_t *out_path, unsigned vpid,
                                     size_t *bytes_written) {
     if (bytes_written) *bytes_written = 0;
     if (!in_path || !out_path) return -1;
-    uint8_t *buf = NULL;
-    size_t n = 0;
-    if (dec_read_whole_w(in_path, &buf, &n) != 0) return -2;
-    cctv_h5e_session session;
-    h5e_session_init(&session);
-    if (n >= 188) h5e_decrypt_ts_inplace(buf, n, &session, (uint16_t)vpid);
-    if (n != 0 && dec_write_whole_w(out_path, buf, n) != 0) {
-        free(buf);
+
+    HANDLE hin = CreateFileW(in_path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hin == INVALID_HANDLE_VALUE) return -2;
+
+    LARGE_INTEGER sz;
+    if (!GetFileSizeEx(hin, &sz) || sz.QuadPart < 0) {
+        CloseHandle(hin);
+        return -2;
+    }
+    const size_t total = (size_t)sz.QuadPart;
+
+    /* 先写 <输出>.part，成功后再原子替换：任何失败都不会破坏已存在的目标文件，
+     * 输入与输出同路径时也因此不会中途改坏原文件（代价是需要额外一份磁盘空间）。 */
+    wchar_t *tmp_path = dec_temp_path(out_path);
+    if (!tmp_path) {
+        CloseHandle(hin);
         return -4;
     }
+    HANDLE hout = CreateFileW(tmp_path, GENERIC_WRITE, 0, NULL, CREATE_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL, NULL);
+    if (hout == INVALID_HANDLE_VALUE) {
+        free(tmp_path);
+        CloseHandle(hin);
+        return -4;
+    }
+
+    cctv_h5e_session session;
+    h5e_session_init(&session);
+
+    uint8_t *buf = NULL;
+    size_t cap = 0;  /* 容器容量 */
+    size_t n = 0;    /* 待处理字节数 */
+    size_t base = 0; /* buf[0] 对应的文件偏移 */
+    size_t nal_total = 0;
+    bool pes_aligned = false; /* buf[0] 是视频 PES 起点时才解密 */
+    bool extra = false;       /* 块已满但未找到切点：再多补一片 */
+    int rc = 0;
+
+    for (;;) {
+        /* ---- 1. 补给：读满目标块（extra 时再加一片），或到文件尾 ---- */
+        size_t target = extra ? n + DEC_READ_SLICE : DEC_CHUNK_BYTES;
+        extra = false;
+        while (n < target && base + n < total) {
+            size_t want = target - n;
+            if (want > DEC_READ_SLICE) want = DEC_READ_SLICE;
+            if (want > total - base - n) want = total - base - n;
+            if (h5e_reserve((void **)&buf, &cap, n + want, 1) != 0) {
+                rc = -3;
+                goto done;
+            }
+            if (!dec_read_at(hin, base + n, buf + n, want)) {
+                rc = -2;
+                goto done;
+            }
+            n += want;
+        }
+        const bool eof = (base + n >= total);
+
+        size_t first = 0, last = 0;
+        const bool found = dec_scan_video_pes(buf, n, (uint16_t)vpid, &first, &last);
+
+        /* ---- 2. 对齐到视频 PES 起点（否则首块无从解密） ---- */
+        if (!pes_aligned) {
+            if (found && first > 0) {
+                /* 前导非视频包（PAT/PMT/音频等）只跳过它们本身，原样写出后重新对齐 */
+                if (!dec_write_at(hout, base, buf, first)) {
+                    rc = -4;
+                    goto done;
+                }
+                base += first;
+                n -= first;
+                memmove(buf, buf + first, n);
+                pes_aligned = true;
+                continue;
+            }
+            if (!found && !eof) {
+                extra = true;
+                continue;
+            }
+            pes_aligned = (found && first == 0);
+            if (!pes_aligned) {
+                /* 到文件尾都没见到视频 PES：剩余原样写出（随后报解密失败） */
+                if (n > 0 && !dec_write_at(hout, base, buf, n)) {
+                    rc = -4;
+                    goto done;
+                }
+                base += n;
+                n = 0;
+                break;
+            }
+        }
+
+        /* ---- 3. 切点：块内最后一个视频 PES 起点，保证下一块从完整 PES 开始 ---- */
+        size_t chunk_len;
+        if (last > 0) {
+            chunk_len = last;
+        } else if (eof) {
+            chunk_len = n; /* 尾块：整段交付（含末尾不足一包的尾巴） */
+        } else {
+            /* 整块只含一个 PES 起点（超长 PES）：再补一片后重试 */
+            extra = true;
+            continue;
+        }
+
+        /* ---- 4. 解密并顺序写回（会话跨块复用，与整文件一次处理等价） ---- */
+        if (pes_aligned && chunk_len > 0) {
+            const long long nc = h5e_decrypt_ts_inplace(buf, chunk_len, &session, (uint16_t)vpid);
+            if (nc < 0) {
+                rc = -3;
+                goto done;
+            }
+            nal_total += (size_t)nc;
+        }
+        if (chunk_len > 0 && !dec_write_at(hout, base, buf, chunk_len)) {
+            rc = -4;
+            goto done;
+        }
+
+        base += chunk_len;
+        n -= chunk_len;
+        if (n > 0) memmove(buf, buf + chunk_len, n);
+        if (n == 0 && eof) break;
+    }
+
+    /* 一个视频 NAL 都没经过会话：PID 不对或不是 TS。旧实现会静默输出未解密副本。 */
+    if (nal_total == 0) {
+        rc = -3;
+        goto done;
+    }
+
+done:
     free(buf);
-    if (bytes_written) *bytes_written = n;
-    return (long long)n;
+    if (rc == 0 && !FlushFileBuffers(hout)) rc = -4;
+    CloseHandle(hout);
+    CloseHandle(hin);
+    if (rc == 0 && !MoveFileExW(tmp_path, out_path, MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+        /* 替换失败（目标被占用 / 只读等）：成品留在临时文件里，便于手动改名 */
+        rc = -4;
+        char *keep = dec_utf8_from_wide(tmp_path);
+        fprintf(stderr, "replace failed, 成品保留在: %s\n", keep ? keep : "?");
+        free(keep);
+    } else if (rc != 0) {
+        DeleteFileW(tmp_path); /* 失败只清理自己的临时文件，不碰目标与输入 */
+    }
+    free(tmp_path);
+    if (rc != 0) return rc;
+    if (bytes_written) *bytes_written = base;
+    return (long long)base;
 }
 
 /* 宽字符 → UTF-8（用于打印中文路径） */
@@ -836,8 +1031,8 @@ int main(void) {
     switch ((int)rc) {
         case -1: msg = "参数错误"; break;
         case -2: msg = "无法读取输入文件"; break;
-        case -3: msg = "解密失败"; break;
-        case -4: msg = "无法写出输出文件"; break;
+        case -3: msg = "解密失败（内存不足 / 未找到视频 PES / PID 不对）"; break;
+        case -4: msg = "无法写出输出文件（磁盘空间不足或目标被占用）"; break;
         default: break;
     }
     fprintf(stderr, "decrypt failed rc=%lld (%s)\n", rc, msg);
