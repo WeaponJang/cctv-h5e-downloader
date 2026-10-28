@@ -771,7 +771,8 @@ const char* cctv_h5e_version(void) {
 #  endif
 #  include <windows.h>
 #else
-#  include <unistd.h>  // isatty
+#  include <sys/types.h>  // off_t
+#  include <unistd.h>     // isatty
 #endif
 
 // 终端适配：只有 stderr 真的连着终端时才切 UTF-8 代码页并开启 ANSI 转义；
@@ -917,32 +918,170 @@ static std::FILE* h5e_fopen(const h5e_path& p, bool for_write) {
 #endif
 }
 
-// 整个文件一次读入（空文件同样返回空向量）
-static std::vector<uint8_t> h5e_read_all(const h5e_path& path) {
-    std::FILE* f = h5e_fopen(path, false);
-    if (!f) return {};
-    std::vector<uint8_t> b;
-    // 尽力按文件大小预留一次；管道/设备/超大文件上 fseek 会失败，跳过即可
-    if (std::fseek(f, 0, SEEK_END) == 0) {
-        const long hint = std::ftell(f);
-        std::rewind(f);
-        if (hint > 0) b.reserve((size_t)hint);
-    }
-    uint8_t chunk[64 * 1024];
-    size_t n = 0;
-    while ((n = std::fread(chunk, 1, sizeof chunk, f)) > 0)
-        b.insert(b.end(), chunk, chunk + n);
-    std::fclose(f);
-    return b;
+// ===== 64 位文件定位/取长 =====
+// 旧实现用 fseek/ftell（Windows 的 long 只有 32 位），超过 2 GB 的输入连长度都
+// 取不到；分块必须能按偏移随机定位，所以统一走 64 位接口。
+static int64_t h5e_file_size(std::FILE* f) {
+#if defined(_WIN32)
+    if (::_fseeki64(f, 0, SEEK_END) != 0) return -1;
+    const int64_t n = ::_ftelli64(f);
+    if (::_fseeki64(f, 0, SEEK_SET) != 0) return -1;
+    return n;
+#else
+    if (::fseeko(f, 0, SEEK_END) != 0) return -1;
+    const int64_t n = (int64_t)::ftello(f);
+    if (::fseeko(f, 0, SEEK_SET) != 0) return -1;
+    return n;
+#endif
 }
 
-// 写文件；close 的返回值也要看——缓冲落盘失败只会在这里暴露
-static bool h5e_write_all(const h5e_path& path, const uint8_t* data, size_t len) {
-    std::FILE* f = h5e_fopen(path, true);
-    if (!f) return false;
-    bool ok = (len == 0) || (std::fwrite(data, 1, len, f) == len);
-    if (std::fclose(f) != 0) ok = false;
-    return ok;
+static bool h5e_seek(std::FILE* f, int64_t off) {
+#if defined(_WIN32)
+    return ::_fseeki64(f, off, SEEK_SET) == 0;
+#else
+    return ::fseeko(f, (off_t)off, SEEK_SET) == 0;
+#endif
+}
+
+// 分阶段输出：part 与目标同目录，最后的替换才是同卷 rename
+static h5e_path h5e_part_path(const h5e_path& out) {
+#if defined(_WIN32)
+    return out + L".part";
+#else
+    return out + ".part";
+#endif
+}
+
+static bool h5e_remove(const h5e_path& p) {
+#if defined(_WIN32)
+    return ::_wremove(p.c_str()) == 0;
+#else
+    return std::remove(p.c_str()) == 0;
+#endif
+}
+
+// 原子替换：part 已经完整落盘（长度校验过）后才调用；失败时目标保持原样。
+// rename 在同一卷内是原子的，而 part 就建在目标所在目录，天然满足同卷。
+static bool h5e_replace(const h5e_path& part, const h5e_path& dst) {
+#if defined(_WIN32)
+    return ::MoveFileExW(part.c_str(), dst.c_str(),
+                         MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) != 0;
+#else
+    return std::rename(part.c_str(), dst.c_str()) == 0;
+#endif
+}
+
+// ===== 分块解密 =====
+// 阶段返回码：0 成功，负数是失败发生在哪一步（用来选提示文案）
+enum {
+    kH5eStageOk = 0,
+    kH5eStageRead = -1,
+    kH5eStageWrite = -2,
+    kH5eStageDecrypt = -3,
+};
+
+struct H5eDecryptStats {
+    uint64_t bytes = 0;    // 已写出的字节数
+    uint64_t nals = 0;     // 交给解密器的 NAL 数
+    uint64_t chunks = 0;   // 分块数
+};
+
+// 视频 PES 起点（PID 命中且 PUSI 置位）。分块只能切在这里：切在包中间或 PES
+// 中间，解密器会拿到半截 PES，输出就和“整文件一次处理”不一致了。
+// 顺序读一遍，索引只存 64 位偏移（每帧 8 字节），扫描缓冲固定 1.5 MB 左右。
+static std::vector<int64_t> h5e_scan_pes_starts(std::FILE* f, uint16_t vpid, bool* read_ok) {
+    constexpr size_t kBlock = 188 * 8192;  // 188 的整数倍，缓冲里始终是整包
+    std::vector<int64_t> starts;
+    std::vector<uint8_t> buf(kBlock);
+    size_t have = 0;
+    int64_t base = 0;  // buf[0] 在文件里的绝对偏移
+    if (read_ok) *read_ok = true;
+    for (;;) {
+        const size_t got = std::fread(buf.data() + have, 1, kBlock - have, f);
+        if (got == 0) {
+            if (read_ok && std::ferror(f)) *read_ok = false;
+            break;
+        }
+        have += got;
+        const size_t pkts = have / 188;
+        for (size_t i = 0; i < pkts; i++) {
+            const uint8_t* p = buf.data() + i * 188;
+            if (p[0] != 0x47) continue;                        // 失步包直接跳过
+            if ((((p[1] & 0x1F) << 8) | p[2]) != vpid) continue;
+            if ((p[1] & 0x40) == 0) continue;                  // 不是 PES 起点
+            starts.push_back(base + (int64_t)(i * 188));
+        }
+        const size_t used = pkts * 188;
+        have -= used;
+        std::memmove(buf.data(), buf.data() + used, have);
+        base += (int64_t)used;
+    }
+    return starts;  // 文件尾不足 188 字节的残包凑不成包，只能丢弃
+}
+
+// 按 PES 边界分块解密：每块“读入 → 原地解密 → 追加写 part”，
+// Session 全程复用（type25 决定 new_mode，丢掉它后面所有块都解不动）。
+// 内存 = 单块（约 64 MB，遇到跨块的超长 PES 会更大）+ 分块索引。
+static int h5e_decrypt_stream(std::FILE* in, std::FILE* out, int64_t total,
+                              const std::vector<int64_t>& pes_starts, uint16_t vpid,
+                              H5eDecryptStats* st) {
+    constexpr int64_t kChunkBytes = 64LL << 20;
+    cctv_h5e_session* s = cctv_h5e_session_create();
+    if (!s) return kH5eStageDecrypt;
+    std::vector<uint8_t> chunk;
+    chunk.reserve((size_t)kChunkBytes);
+    int stage = kH5eStageOk;
+    size_t next = 0;    // pes_starts 游标，只增不减
+    int64_t begin = 0;  // 本块起点：首块 0，之后都是 PES 起点
+    while (begin < total) {
+        const int64_t want = begin + kChunkBytes;
+        while (next < pes_starts.size() && pes_starts[next] < want) next++;
+        const int64_t end = next < pes_starts.size() ? pes_starts[next] : total;
+        const size_t len = (size_t)(end - begin);
+        chunk.resize(len);
+        if (!h5e_seek(in, begin) || std::fread(chunk.data(), 1, len, in) != len) {
+            stage = kH5eStageRead;
+            break;
+        }
+        // 原地解密：长度由 AF 填充吸收，块内字节数不变
+        const int nals = cctv_h5e_decrypt_ts(s, chunk.data(), len, vpid);
+        if (nals < 0) {
+            stage = kH5eStageDecrypt;
+            break;
+        }
+        if (std::fwrite(chunk.data(), 1, len, out) != len) {
+            stage = kH5eStageWrite;
+            break;
+        }
+        if (st) {
+            st->bytes += len;
+            st->nals += (uint64_t)nals;
+            st->chunks++;
+        }
+        begin = end;
+    }
+    cctv_h5e_session_destroy(s);
+    return stage;
+}
+
+// 没有任何视频 PES：解密器不会改动一个字节，按固定块原样搬运即可——
+// 结果与旧行为（输出等于输入）一致，又不会把整个文件读进内存。
+static int h5e_copy_stream(std::FILE* in, std::FILE* out, int64_t total, H5eDecryptStats* st) {
+    constexpr int64_t kBlock = 1LL << 20;
+    std::vector<uint8_t> buf((size_t)kBlock);
+    if (!h5e_seek(in, 0)) return kH5eStageRead;
+    for (int64_t done = 0; done < total;) {
+        const int64_t left = total - done;
+        const size_t want = (size_t)(left < kBlock ? left : kBlock);
+        if (std::fread(buf.data(), 1, want, in) != want) return kH5eStageRead;
+        if (std::fwrite(buf.data(), 1, want, out) != want) return kH5eStageWrite;
+        done += (int64_t)want;
+        if (st) {
+            st->bytes += want;
+            st->chunks++;
+        }
+    }
+    return kH5eStageOk;
 }
 
 #if defined(_WIN32)
@@ -999,40 +1138,113 @@ int main(int argc, char** argv)
     }
     const h5e_path in_path(argv[1]);
     const h5e_path out_path(argv[2]);
-    const auto enc = h5e_read_all(in_path);
-    if (enc.empty()) {
+    const h5e_path part_path = h5e_part_path(out_path);
+
+    std::FILE* fin = h5e_fopen(in_path, false);
+    const int64_t in_size = fin ? h5e_file_size(fin) : -1;
+    if (!fin || in_size < 0) {
+        if (fin) std::fclose(fin);
         h5e_note(paint, h5e_sgr_red, "错误",
                  ("无法读取输入文件：" + h5e_path_utf8(in_path)).c_str());
         h5e_note(paint, h5e_sgr_dim, "提示", "请确认文件存在、不是目录，且当前用户有读取权限");
         return 1;
     }
-    uint8_t* out = nullptr;
-    size_t out_len = 0;
-    const int rc = cctv_h5e_decrypt_ts_alloc(enc.data(), enc.size(), &out, &out_len, vpid);
-    if (rc != 0 || !out) {
-        char msg[80];
-        std::snprintf(msg, sizeof msg, "解密失败（返回码 rc=%d）", rc);
-        h5e_note(paint, h5e_sgr_red, "错误", msg);
+    if (in_size == 0) {
+        std::fclose(fin);
+        h5e_note(paint, h5e_sgr_red, "错误",
+                 ("输入文件为空：" + h5e_path_utf8(in_path)).c_str());
+        h5e_note(paint, h5e_sgr_dim, "提示", "请确认拿到的是完整的加密 TS，而不是还没下载完的空壳");
         return 1;
     }
-    if (!h5e_write_all(out_path, out, out_len)) {
-        cctv_h5e_free(out);
+
+    // 先扫一遍视频 PES 起点当分块边界（顺序读，只存偏移）
+    bool scan_ok = true;
+    const std::vector<int64_t> pes_starts = h5e_scan_pes_starts(fin, vpid, &scan_ok);
+    if (!scan_ok) {
+        std::fclose(fin);
         h5e_note(paint, h5e_sgr_red, "错误",
-                 ("无法写入输出文件：" + h5e_path_utf8(out_path)).c_str());
+                 ("读取输入文件失败：" + h5e_path_utf8(in_path)).c_str());
+        h5e_note(paint, h5e_sgr_dim, "提示", "请确认文件没有被截断或占用，磁盘可以正常读取");
+        return 1;
+    }
+
+    // 全程只写 part：目标文件在成功前一个字节都不动
+    std::FILE* fpart = h5e_fopen(part_path, true);
+    if (!fpart) {
+        std::fclose(fin);
+        h5e_note(paint, h5e_sgr_red, "错误",
+                 ("无法写入输出文件：" + h5e_path_utf8(part_path)).c_str());
         h5e_note(paint, h5e_sgr_dim, "提示", "请确认目标目录存在、不是只读，且磁盘空间充足");
         return 1;
     }
-    cctv_h5e_free(out);
+
+    H5eDecryptStats stats;
+    int stage = pes_starts.empty()
+                    ? h5e_copy_stream(fin, fpart, in_size, &stats)
+                    : h5e_decrypt_stream(fin, fpart, in_size, pes_starts, vpid, &stats);
+    // close 的返回值也要看——缓冲落盘失败只会在这里暴露
+    const bool flushed = (std::fclose(fpart) == 0);
+    std::fclose(fin);  // 先放开输入：<输入> 与 <输出> 是同一个文件时才能替掉
+    if (stage == kH5eStageOk && !flushed) stage = kH5eStageWrite;
+
+    if (stage != kH5eStageOk) {
+        h5e_remove(part_path);
+        if (stage == kH5eStageRead) {
+            h5e_note(paint, h5e_sgr_red, "错误",
+                     ("读取输入文件失败：" + h5e_path_utf8(in_path)).c_str());
+            h5e_note(paint, h5e_sgr_dim, "提示", "请确认文件没有被截断或占用，磁盘可以正常读取");
+        } else if (stage == kH5eStageWrite) {
+            h5e_note(paint, h5e_sgr_red, "错误",
+                     ("无法写入输出文件：" + h5e_path_utf8(part_path)).c_str());
+            h5e_note(paint, h5e_sgr_dim, "提示", "临时文件已删除，目标文件未被改动；请检查磁盘空间与目录权限");
+        } else {
+            h5e_note(paint, h5e_sgr_red, "错误", "解密失败（原生 h5e 返回异常）");
+            h5e_note(paint, h5e_sgr_dim, "提示", "请确认输入确实是 hls_h5e 加密的 TS，且 --pid 指向视频流");
+        }
+        return 1;
+    }
+    if (stats.bytes != (uint64_t)in_size) {
+        h5e_remove(part_path);
+        char msg[128];
+        std::snprintf(msg, sizeof msg, "解密结果长度异常（%llu / %llu 字节）",
+                      (unsigned long long)stats.bytes, (unsigned long long)in_size);
+        h5e_note(paint, h5e_sgr_red, "错误", msg);
+        h5e_note(paint, h5e_sgr_dim, "提示", "临时文件已删除，目标文件未被改动");
+        return 1;
+    }
+
+    // 只有到这里才动目标文件：同目录 rename，失败时目标保持原样
+    if (!h5e_replace(part_path, out_path)) {
+        std::string msg = "无法替换输出文件";
+#if defined(_WIN32)
+        msg += "（Win32 错误 " + std::to_string((unsigned long)::GetLastError()) + "）";
+#endif
+        msg += "：";
+        msg += h5e_path_utf8(out_path);
+        h5e_remove(part_path);
+        h5e_note(paint, h5e_sgr_red, "错误", msg.c_str());
+        h5e_note(paint, h5e_sgr_dim, "提示",
+                 "临时文件已删除，目标文件未被改动；请确认目标没有被其他程序占用、目录可写");
+        return 1;
+    }
 
     const long long ms = std::chrono::duration_cast<std::chrono::milliseconds>(
                              std::chrono::steady_clock::now() - t0)
                              .count();
-    char detail[128];
-    std::snprintf(detail, sizeof detail, "视频 PID 0x%03X · 耗时 %s", (unsigned)vpid,
-                  h5e_seconds(ms).c_str());
+    char detail[160];
+    std::snprintf(detail, sizeof detail, "视频 PID 0x%03X · %llu 块 · %llu NAL · 耗时 %s",
+                  (unsigned)vpid, (unsigned long long)stats.chunks,
+                  (unsigned long long)stats.nals, h5e_seconds(ms).c_str());
     h5e_note(paint, h5e_sgr_green, "完成",
-             (h5e_group(out_len) + " 字节 → " + h5e_path_utf8(out_path)).c_str());
+             (h5e_group(stats.bytes) + " 字节 → " + h5e_path_utf8(out_path)).c_str());
     h5e_note(paint, h5e_sgr_dim, "详情", detail);
+    if (pes_starts.empty()) {
+        char warn[160];
+        std::snprintf(warn, sizeof warn,
+                      "未找到视频 PES（PID 0x%03X），输入已原样复制，未解密任何 NAL",
+                      (unsigned)vpid);
+        h5e_note(paint, h5e_sgr_dim, "提示", warn);
+    }
     return 0;
 }
 #endif
