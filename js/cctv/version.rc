@@ -21,7 +21,7 @@
 // ---- 版本号（需要升级时只改这四个宏） ----
 #define VER_MAJOR  4
 #define VER_MINOR  5
-#define VER_PATCH  2
+#define VER_PATCH  4
 #define VER_BUILD  0
 
 VS_VERSION_INFO VERSIONINFO
@@ -41,8 +41,8 @@ BEGIN
         BEGIN
             VALUE "FileDescription",  "CCTV HLS h5e MPEG-TS 解密工具"
             VALUE "ProductName",      "cctv_h5e_decrypt"
-            VALUE "ProductVersion",   "4.5.2.0"
-            VALUE "FileVersion",      "4.5.2.0"
+            VALUE "ProductVersion",   "4.5.4.0"
+            VALUE "FileVersion",      "4.5.4.0"
             VALUE "OriginalFilename", "dec.exe"
             VALUE "InternalName",     "dec"
             VALUE "CompanyName",      "CCTV h5e decrypt"

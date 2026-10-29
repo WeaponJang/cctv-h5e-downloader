@@ -442,7 +442,7 @@ int main(int argc, char** argv)
                  (prog + " <输入文件.ts> <输出文件.ts> [--pid 0x100]").c_str());
         h5e_note(paint, h5e_sgr_plain, "参数", "--pid <十六进制>   指定视频 PID，默认 0x100");
         h5e_note(paint, h5e_sgr_plain, "示例", "dec.exe 加密.ts 解密.ts");
-        h5e_note(paint, h5e_sgr_plain, "    ", "dec.exe 加密.ts 解密.ts --pid 0x1fff");
+        h5e_note(paint, h5e_sgr_plain, "    ", "dec.exe 加密.ts 解密.ts --pid 0x100");
         return 1;
     }
     uint16_t vpid = 0x100;
